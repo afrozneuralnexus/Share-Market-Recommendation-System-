@@ -2,14 +2,8 @@ streamlit
 yfinance
 pandas
 numpy
-matplotlib
-plotly
 textblob
 vaderSentiment
-ta
-scikit-learn
-tensorflow
-nltk
-requests
-beautifulsoup4
+ta-lib
+
 
