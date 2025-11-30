@@ -321,4 +321,3 @@ class DataAnalysisApp:
 if __name__ == "__main__":
     app = DataAnalysisApp()
     app.main()
-
