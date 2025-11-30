@@ -4,6 +4,6 @@ pandas
 numpy
 textblob
 vaderSentiment
-ta-lib
+ta
 
 
