@@ -2,133 +2,176 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-import talib
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
+
+# Try TA-Lib
+try:
+    import talib
+    TA_LIB_AVAILABLE = True
+except:
+    TA_LIB_AVAILABLE = False
+
+# Fallback "ta" library
+try:
+    import ta
+    TA_FALLBACK_AVAILABLE = True
+except:
+    TA_FALLBACK_AVAILABLE = False
 
 # Sentiment Analysis
 try:
     from textblob import TextBlob
     TEXTBLOB_AVAILABLE = True
-except ImportError:
+except:
     TEXTBLOB_AVAILABLE = False
 
 try:
     from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-    VADER_AVAILABLE = True
     vader = SentimentIntensityAnalyzer()
-except ImportError:
+    VADER_AVAILABLE = True
+except:
     VADER_AVAILABLE = False
 
 
 # -----------------------------
-# SENTIMENT ANALYSIS FUNCTION
+# SENTIMENT ANALYSIS
 # -----------------------------
 def get_sentiment(text):
     results = {}
-
-    # TextBlob
     if TEXTBLOB_AVAILABLE:
-        blob = TextBlob(text)
-        results['textblob_sentiment'] = blob.sentiment.polarity
+        results["textblob"] = TextBlob(text).sentiment.polarity
     else:
-        results['textblob_sentiment'] = None
+        results["textblob"] = None
 
-    # VADER
     if VADER_AVAILABLE:
-        score = vader.polarity_scores(text)
-        results['vader_sentiment'] = score['compound']
+        results["vader"] = vader.polarity_scores(text)["compound"]
     else:
-        results['vader_sentiment'] = None
+        results["vader"] = None
 
     return results
 
 
 # -----------------------------
-# TECHNICAL ANALYSIS FEATURES
+# TECHNICAL INDICATORS
 # -----------------------------
-def add_technical_indicators(df):
-    df['RSI'] = talib.RSI(df['Close'], timeperiod=14)
-    df['EMA_20'] = talib.EMA(df['Close'], timeperiod=20)
-    df['EMA_50'] = talib.EMA(df['Close'], timeperiod=50)
-    df['MACD'], df['MACD_signal'], df['MACD_hist'] = talib.MACD(df['Close'])
-    df['BB_upper'], df['BB_middle'], df['BB_lower'] = talib.BBANDS(df['Close'])
+def add_indicators(df):
+
+    if TA_LIB_AVAILABLE:
+        df["RSI"] = talib.RSI(df["Close"])
+        df["EMA20"] = talib.EMA(df["Close"], timeperiod=20)
+        df["EMA50"] = talib.EMA(df["Close"], timeperiod=50)
+        df["MACD"], df["MACD_signal"], _ = talib.MACD(df["Close"])
+    elif TA_FALLBACK_AVAILABLE:
+        df["RSI"] = ta.momentum.RSIIndicator(df["Close"]).rsi()
+        df["EMA20"] = ta.trend.EMAIndicator(df["Close"], window=20).ema_indicator()
+        df["EMA50"] = ta.trend.EMAIndicator(df["Close"], window=50).ema_indicator()
+        macd = ta.trend.MACD(df["Close"])
+        df["MACD"] = macd.macd()
+        df["MACD_signal"] = macd.macd_signal()
+    else:
+        df["RSI"] = np.nan
+        df["EMA20"] = np.nan
+        df["EMA50"] = np.nan
+        df["MACD"] = np.nan
+        df["MACD_signal"] = np.nan
+
     return df
 
 
 # -----------------------------
-# STOCK BUY SCORE FUNCTION
+# SCORING MODEL
 # -----------------------------
-def stock_score(df, sentiment_scores):
+def score_stock(df, sentiment):
     score = 0
 
-    # RSI rule
-    if df['RSI'].iloc[-1] < 30:
+    try:
+        rsi = df["RSI"].iloc[-1]
+        ema20 = df["EMA20"].iloc[-1]
+        ema50 = df["EMA50"].iloc[-1]
+        macd = df["MACD"].iloc[-1]
+        macd_sig = df["MACD_signal"].iloc[-1]
+    except:
+        return 0
+
+    # RSI
+    if rsi < 30:
         score += 2
-    elif df['RSI'].iloc[-1] < 45:
+    elif rsi < 45:
         score += 1
 
-    # EMA crossover rule
-    if df['EMA_20'].iloc[-1] > df['EMA_50'].iloc[-1]:
+    # EMA crossover
+    if ema20 > ema50:
         score += 2
 
-    # MACD rule
-    if df['MACD'].iloc[-1] > df['MACD_signal'].iloc[-1]:
+    # MACD momentum
+    if macd > macd_sig:
         score += 2
 
-    # Sentiment rule
-    if sentiment_scores['vader_sentiment'] is not None:
-        if sentiment_scores['vader_sentiment'] > 0.3:
+    # Sentiment (VADER)
+    if sentiment["vader"] is not None:
+        if sentiment["vader"] > 0.3:
             score += 2
-        elif sentiment_scores['vader_sentiment'] > 0:
+        elif sentiment["vader"] > 0:
             score += 1
 
     return score
 
 
 # -----------------------------
-# STREAMLIT UI
+# STREAMLIT APP
 # -----------------------------
-st.title("📊 Stock Comparison & Recommendation System")
-st.write("Compare 5 stocks with Technical + Sentiment Analysis")
+st.title("📈 Stock Comparison & Recommendation System")
+st.write("Technical + Sentiment + Scoring")
 
-tickers = st.text_input("Enter 5 Stock Symbols (comma separated)", "AAPL, MSFT, GOOG, AMZN, META")
-news_text = st.text_area("Paste latest news or analysis text for sentiment scoring")
+tickers = st.text_input("Enter 5 stock symbols (comma-separated):", "AAPL, MSFT, AMZN, GOOG, META")
+news_text = st.text_area("Paste news or analysis text for sentiment:", "")
 
 if st.button("Compare Stocks"):
-    ticker_list = [t.strip().upper() for t in tickers.split(",")][:5]
+    tickers = [t.strip().upper() for t in tickers.split(",")][:5]
 
     results = []
 
-    for ticker in ticker_list:
+    for t in tickers:
         try:
-            df = yf.download(ticker, period="6mo", interval="1d")
-            df = add_technical_indicators(df)
+            df = yf.download(t, period="6mo", interval="1d", progress=False)
 
-            sentiment_scores = get_sentiment(news_text if news_text else ticker)
+            if df.empty:
+                st.warning(f"⚠ No data for {t}. Skipping (possibly rate limit).")
+                continue
 
-            score = stock_score(df, sentiment_scores)
+            df = add_indicators(df)
+            sentiment = get_sentiment(news_text if news_text else t)
+            score = score_stock(df, sentiment)
 
             results.append({
-                "Ticker": ticker,
-                "RSI": round(df['RSI'].iloc[-1], 2),
-                "EMA_20": round(df['EMA_20'].iloc[-1], 2),
-                "EMA_50": round(df['EMA_50'].iloc[-1], 2),
-                "MACD": round(df['MACD'].iloc[-1], 2),
-                "Sentiment (VADER)": sentiment_scores["vader_sentiment"],
+                "Ticker": t,
+                "RSI": round(df["RSI"].iloc[-1], 2),
+                "EMA20": round(df["EMA20"].iloc[-1], 2),
+                "EMA50": round(df["EMA50"].iloc[-1], 2),
+                "MACD": round(df["MACD"].iloc[-1], 2),
+                "Sentiment (VADER)": sentiment["vader"],
                 "Final Score": score
             })
-        except:
-            st.error(f"Error fetching {ticker}")
 
-    results_df = pd.DataFrame(results)
-    st.dataframe(results_df)
+        except Exception as e:
+            st.error(f"❌ Error fetching {t}: {e}")
 
-    best_stock = results_df.sort_values("Final Score", ascending=False).iloc[0]
-    st.success(f"🏆 **Best Stock to Buy: {best_stock['Ticker']}**")
-    st.write(f"### Why?")
-    st.write(f"- RSI: {best_stock['RSI']}")
-    st.write(f"- EMA Trend: {best_stock['EMA_20']} > {best_stock['EMA_50']}")
-    st.write(f"- MACD: {best_stock['MACD']}")
-    st.write(f"- Sentiment Score: {best_stock['Sentiment (VADER)']}")
+    # Prevent crash if all tickers fail
+    if not results:
+        st.error("❌ No stock data could be loaded (Yahoo rate limit). Try again in 30–60 seconds.")
+        st.stop()
+
+    df_results = pd.DataFrame(results)
+    st.subheader("📊 Comparison Table")
+    st.dataframe(df_results)
+
+    best = df_results.sort_values("Final Score", ascending=False).iloc[0]
+
+    st.success(f"🏆 **Best Stock to Buy: {best['Ticker']}**")
+    st.write("### Why?")
+    st.write(f"- RSI → `{best['RSI']}`")
+    st.write(f"- EMA(20) `{best['EMA20']}` > EMA(50) `{best['EMA50']}`")
+    st.write(f"- MACD → `{best['MACD']}`")
+    st.write(f"- Sentiment → `{best['Sentiment (VADER)']}`")
+
