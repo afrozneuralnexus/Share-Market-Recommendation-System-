@@ -1,727 +1,389 @@
-import streamlit as st
+!pip install vaderSentiment -q
+!pip install TA-Lib -q
+
+"""
+Stock comparator with sentiment analysis + technical analysis (yfinance, TA-Lib)
+
+Features:
+- Fetch historical price + fundamentals from Yahoo
+- Compute financial metrics (return, volatility, Sharpe, momentum, PE, dividend yield)
+- Dual sentiment analysis: TextBlob + VADER
+- Technical indicators: RSI, MACD, Bollinger Bands, MA Trend, ADX, Stochastic
+- Weighted composite scoring → Final recommendation with confidence level
+"""
+
+import yfinance as yf
 import pandas as pd
 import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
-from sklearn.datasets import make_classification, make_regression
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, mean_squared_error, classification_report
-import io
-import yfinance as yf
 from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-# Page configuration
-st.set_page_config(
-    page_title="Data Analysis Dashboard",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# Sentiment Analysis Packages
+try:
+    from textblob import TextBlob
+    TEXTBLOB_AVAILABLE = True
+except:
+    TEXTBLOB_AVAILABLE = False
 
-# Stock Market Sectors
-SECTORS = {
-    "Information Technology (IT) & Services": [
-        "TCS.NS", "INFY.NS", "HCLTECH.NS", "WIPRO.NS", "TECHM.NS"
-    ],
-    "Banking & Financial Services": [
-        "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "KOTAKBANK.NS", "AXISBANK.NS", "BAJFINANCE.NS", "HDFCLIFE.NS", "ICICIPRULI.NS"
-    ],
-    "Conglomerates & Industrial": [
-        "RELIANCE.NS", "LT.NS", "TATAMOTORS.NS", "TATASTEEL.NS", "M&M.NS"
-    ],
-    "Consumer Goods & Telecom": [
-        "ITC.NS", "HINDUNILVR.NS", "BRITANNIA.NS", "BHARTIARTL.NS", "MARUTI.NS"
-    ],
-    "Energy & Commodities": [
-        "ONGC.NS", "NTPC.NS", "COALINDIA.NS", "HINDALCO.NS", "JSWSTEEL.NS"
-    ]
+try:
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    VADER_AVAILABLE = True
+except:
+    VADER_AVAILABLE = False
+
+# Technical Analysis
+try:
+    import talib
+    TALIB_AVAILABLE = True
+except:
+    TALIB_AVAILABLE = False
+
+# ---------- Input Settings ----------
+TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
+HISTORY_YEARS = 3
+RISK_FREE = 0.03
+WEIGHTS = {
+    "annual_return": 0.18,
+    "sharpe": 0.15,
+    "volatility": 0.10,
+    "pe": 0.07,
+    "dividend_yield": 0.07,
+    "momentum": 0.10,
+    "sentiment": 0.18,
+    "technical": 0.15
 }
+# ------------------------------------
 
-# Custom CSS
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 3rem;
-        color: #1f77b4;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 1rem;
-        border-radius: 10px;
-        border-left: 5px solid #1f77b4;
-    }
-    .sector-card {
-        background-color: #ffffff;
-        padding: 1rem;
-        border-radius: 10px;
-        border-left: 5px solid #ff6b6b;
-        margin: 0.5rem 0;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
-</style>
-""", unsafe_allow_html=True)
+def fetch_data(ticker, period_years=HISTORY_YEARS):
+    end = datetime.today()
+    start = end - timedelta(days=int(365.25 * period_years))
+    tk = yf.Ticker(ticker)
+    hist = tk.history(start=start.date(), end=end.date(), interval="1d", auto_adjust=True)
+    info = tk.info
+    return hist, info, tk
 
-class DataAnalysisApp:
-    def __init__(self):
-        self.df = None
-        self.stock_data = None
-        self.initialize_session_state()
-    
-    def initialize_session_state(self):
-        """Initialize session state variables"""
-        if 'data_loaded' not in st.session_state:
-            st.session_state.data_loaded = False
-        if 'stock_data_loaded' not in st.session_state:
-            st.session_state.stock_data_loaded = False
-        if 'current_tab' not in st.session_state:
-            st.session_state.current_tab = "Data Explorer"
-    
-    def main(self):
-        """Main application function"""
-        # Header
-        st.markdown('<h1 class="main-header">📊 Data Analysis Dashboard</h1>', 
-                   unsafe_allow_html=True)
-        
-        # Sidebar
-        self.render_sidebar()
-        
-        # Main content based on selected tab
-        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-            "🏠 Data Explorer", 
-            "📈 Visualization", 
-            "🤖 ML Modeling", 
-            "📋 Statistics",
-            "📊 Stock Analysis",
-            "⚙️ Settings"
-        ])
-        
-        with tab1:
-            self.data_explorer_tab()
-        
-        with tab2:
-            self.visualization_tab()
-        
-        with tab3:
-            self.ml_modeling_tab()
-        
-        with tab4:
-            self.statistics_tab()
-        
-        with tab5:
-            self.stock_analysis_tab()
-        
-        with tab6:
-            self.settings_tab()
-    
-    def render_sidebar(self):
-        """Render sidebar components"""
-        st.sidebar.title("Navigation")
-        
-        # Data upload section
-        st.sidebar.header("📁 Data Management")
-        
-        upload_option = st.sidebar.radio(
-            "Choose data source:",
-            ["Upload CSV", "Use Sample Data", "Stock Market Data"]
+def annualized_return_from_series(price_series):
+    if price_series.empty: return np.nan
+    n_days = (price_series.index[-1] - price_series.index[0]).days
+    if n_days <= 0: return np.nan
+    total_return = price_series.iloc[-1] / price_series.iloc[0] - 1
+    years = n_days / 365.25
+    return (1 + total_return)**(1/years) - 1
+
+def annualized_volatility(daily_returns):
+    if daily_returns.dropna().empty: return np.nan
+    return daily_returns.std() * np.sqrt(252)
+
+def sharpe_ratio(annual_return, ann_vol, risk_free=RISK_FREE):
+    if pd.isna(annual_return) or pd.isna(ann_vol) or ann_vol == 0:
+        return np.nan
+    return (annual_return - risk_free) / ann_vol
+
+def momentum_12m(price_series):
+    if price_series.empty: return np.nan
+    end = price_series.index[-1]
+    start_date = end - pd.DateOffset(months=12)
+    try:
+        start_price = price_series.loc[price_series.index >= start_date].iloc[0]
+    except:
+        start_price = price_series.iloc[0]
+    return price_series.iloc[-1] / start_price - 1
+
+def safe_get(info, key, default=np.nan):
+    try:
+        return info.get(key, default)
+    except:
+        return default
+
+# ============================================================
+#   SENTIMENT ANALYSIS (TextBlob + VADER)
+# ============================================================
+
+def get_comprehensive_sentiment(ticker_obj, ticker_symbol):
+
+    sentiment = {
+        'textblob_score': 0.0,
+        'vader_score': 0.0,
+        'combined_score': 0.0,
+        'article_count': 0,
+        'positive_count': 0,
+        'negative_count': 0,
+        'neutral_count': 0
+    }
+
+    if not TEXTBLOB_AVAILABLE and not VADER_AVAILABLE:
+        return sentiment
+
+    try:
+        vader = SentimentIntensityAnalyzer() if VADER_AVAILABLE else None
+        news = ticker_obj.news
+
+        if not news:
+            return sentiment
+
+        tb_scores, vd_scores = [], []
+
+        for article in news[:15]:
+            title = article.get("title", "")
+            summary = article.get("summary", "")
+            text = f"{title}. {summary}".strip()
+            if not text: continue
+
+            # TextBlob
+            if TEXTBLOB_AVAILABLE:
+                tb = TextBlob(text).sentiment.polarity
+                tb_scores.append(tb)
+
+            # VADER
+            if VADER_AVAILABLE:
+                vd = vader.polarity_scores(text)["compound"]
+                vd_scores.append(vd)
+
+                if vd >= 0.05:
+                    sentiment["positive_count"] += 1
+                elif vd <= -0.05:
+                    sentiment["negative_count"] += 1
+                else:
+                    sentiment["neutral_count"] += 1
+
+        if tb_scores:
+            sentiment["textblob_score"] = np.mean(tb_scores)
+        if vd_scores:
+            sentiment["vader_score"] = np.mean(vd_scores)
+
+        sentiment["article_count"] = len(tb_scores) or len(vd_scores)
+
+        scores = []
+        if tb_scores: scores.append(sentiment["textblob_score"])
+        if vd_scores: scores.append(sentiment["vader_score"])
+
+        if scores:
+            sentiment["combined_score"] = np.mean(scores)
+
+        return sentiment
+
+    except Exception as e:
+        print(f"Sentiment error for {ticker_symbol}: {e}")
+        return sentiment
+
+# ============================================================
+#   TECHNICAL ANALYSIS (TA-Lib)
+# ============================================================
+
+def compute_technical_indicators(hist_df):
+
+    if not TALIB_AVAILABLE or hist_df.empty or len(hist_df) < 50:
+        return {key: np.nan for key in
+                ["rsi","macd_signal","bb_position","ma_trend","adx","stoch","technical_score"]} | {
+                "signal_strength": "N/A"}
+
+    try:
+        close = hist_df["Close"].values
+        high = hist_df["High"].values
+        low = hist_df["Low"].values
+
+        rsi = talib.RSI(close, 14)[-1]
+        rsi = 50 if np.isnan(rsi) else rsi
+
+        macd, signal, _ = talib.MACD(close)
+        macd_signal = 1 if macd[-1] > signal[-1] else -1
+
+        upper, mid, lower = talib.BBANDS(close, 20)
+        bb_position = (close[-1] - lower[-1]) / (upper[-1] - lower[-1])
+
+        ma50 = talib.SMA(close, 50)[-1]
+        ma200 = talib.SMA(close, 200)[-1]
+        ma_trend = 1 if ma50 > ma200 else -1
+
+        adx = talib.ADX(high, low, close, 14)[-1]
+        stoch_k, stoch_d = talib.STOCH(high, low, close)
+        stoch = stoch_k[-1]
+
+        # ----- Build technical score -----
+        rsi_score = 0.9 if rsi < 30 else 0.7 if rsi < 40 else 0.5 if rsi < 60 else 0.3
+        macd_score = 0.7 if macd_signal == 1 else 0.3
+        bb_score = bb_position
+        ma_score = 0.7 if ma_trend == 1 else 0.3
+        adx_score = min(adx / 50, 1.0) if adx > 25 else 0.3
+        stoch_score = 0.8 if stoch < 20 else 0.5 if stoch < 80 else 0.2
+
+        tech_score = (
+            rsi_score * 0.25 +
+            macd_score * 0.25 +
+            bb_score * 0.15 +
+            ma_score * 0.20 +
+            adx_score * 0.10 +
+            stoch_score * 0.05
         )
-        
-        if upload_option == "Upload CSV":
-            uploaded_file = st.sidebar.file_uploader(
-                "Upload your CSV file", 
-                type=['csv'],
-                help="Upload a CSV file to analyze"
-            )
-            
-            if uploaded_file is not None:
-                try:
-                    self.df = pd.read_csv(uploaded_file)
-                    st.session_state.data_loaded = True
-                    st.session_state.stock_data_loaded = False
-                    st.sidebar.success(f"✅ Data loaded successfully! Shape: {self.df.shape}")
-                except Exception as e:
-                    st.sidebar.error(f"Error loading file: {str(e)}")
-        
-        elif upload_option == "Use Sample Data":
-            sample_option = st.sidebar.selectbox(
-                "Choose sample dataset:",
-                ["Iris Classification", "Sales Data", "Random Regression"]
-            )
-            
-            if st.sidebar.button("Generate Sample Data"):
-                self.generate_sample_data(sample_option)
-                st.session_state.stock_data_loaded = False
-        
-        else:  # Stock Market Data
-            st.sidebar.header("📈 Stock Data Settings")
-            
-            # Date range selection
-            col1, col2 = st.sidebar.columns(2)
-            with col1:
-                start_date = st.date_input("Start Date", datetime.now() - timedelta(days=365))
-            with col2:
-                end_date = st.date_input("End Date", datetime.now())
-            
-            # Sector selection
-            selected_sector = st.sidebar.selectbox(
-                "Select Sector",
-                list(SECTORS.keys()) + ["All Sectors"]
-            )
-            
-            # Individual stock selection
-            if selected_sector != "All Sectors":
-                selected_stocks = st.sidebar.multiselect(
-                    "Select Stocks",
-                    SECTORS[selected_sector],
-                    default=SECTORS[selected_sector][:3]
-                )
-            else:
-                all_stocks = []
-                for sector_stocks in SECTORS.values():
-                    all_stocks.extend(sector_stocks)
-                selected_stocks = st.sidebar.multiselect(
-                    "Select Stocks",
-                    all_stocks,
-                    default=all_stocks[:5]
-                )
-            
-            if st.sidebar.button("Fetch Stock Data") and selected_stocks:
-                with st.spinner("Fetching stock data..."):
-                    self.fetch_stock_data(selected_stocks, start_date, end_date)
-        
-        # Data info if loaded
-        if st.session_state.data_loaded and self.df is not None:
-            st.sidebar.header("📊 Data Info")
-            st.sidebar.write(f"**Shape:** {self.df.shape}")
-            st.sidebar.write(f"**Columns:** {len(self.df.columns)}")
-            st.sidebar.write(f"**Memory usage:** {self.df.memory_usage(deep=True).sum() / 1024**2:.2f} MB")
-        
-        if st.session_state.stock_data_loaded and self.stock_data is not None:
-            st.sidebar.header("📈 Stock Data Info")
-            st.sidebar.write(f"**Stocks:** {len(self.stock_data.columns.levels[0])}")
-            st.sidebar.write(f"**Period:** {len(self.stock_data)} days")
-    
-    def fetch_stock_data(self, symbols, start_date, end_date):
-        """Fetch stock data from Yahoo Finance"""
+
+        strength = (
+            "STRONG BUY" if tech_score >= 0.7 else
+            "BUY" if tech_score >= 0.6 else
+            "HOLD" if tech_score >= 0.4 else
+            "WEAK SELL" if tech_score >= 0.3 else
+            "SELL"
+        )
+
+        return {
+            "rsi": rsi,
+            "macd_signal": macd_signal,
+            "bb_position": bb_position,
+            "ma_trend": ma_trend,
+            "adx": adx,
+            "stoch": stoch,
+            "technical_score": tech_score,
+            "signal_strength": strength
+        }
+
+    except Exception as e:
+        print("TA error:", e)
+        return {key: np.nan for key in
+                ["rsi","macd_signal","bb_position","ma_trend","adx","stoch","technical_score"]} | {
+                "signal_strength": "N/A"}
+
+# ============================================================
+#   BUILD DATASET FOR ALL TICKERS
+# ============================================================
+
+def build_metrics(tickers):
+    rows = []
+
+    for t in tickers:
+        print("Processing:", t)
         try:
-            data = yf.download(symbols, start=start_date, end=end_date, group_by='ticker')
-            
-            if len(symbols) == 1:
-                # Single stock case
-                self.stock_data = pd.DataFrame(data)
-                self.stock_data.columns = pd.MultiIndex.from_product([[symbols[0]], self.stock_data.columns])
-            else:
-                self.stock_data = data
-            
-            st.session_state.stock_data_loaded = True
-            st.session_state.data_loaded = False
-            st.sidebar.success(f"✅ Stock data loaded for {len(symbols)} stocks!")
-            
-        except Exception as e:
-            st.sidebar.error(f"Error fetching stock data: {str(e)}")
-    
-    def generate_sample_data(self, dataset_type):
-        """Generate sample datasets"""
-        if dataset_type == "Iris Classification":
-            from sklearn.datasets import load_iris
-            iris = load_iris()
-            self.df = pd.DataFrame(iris.data, columns=iris.feature_names)
-            self.df['target'] = iris.target
-            self.df['species'] = self.df['target'].map({0: 'setosa', 1: 'versicolor', 2: 'virginica'})
-        
-        elif dataset_type == "Sales Data":
-            np.random.seed(42)
-            dates = pd.date_range('2023-01-01', periods=1000, freq='D')
-            self.df = pd.DataFrame({
-                'date': dates,
-                'product': np.random.choice(['Product A', 'Product B', 'Product C'], 1000),
-                'region': np.random.choice(['North', 'South', 'East', 'West'], 1000),
-                'sales': np.random.normal(1000, 200, 1000),
-                'quantity': np.random.randint(1, 50, 1000),
-                'customer_rating': np.random.uniform(1, 5, 1000)
-            })
-            self.df['revenue'] = self.df['sales'] * self.df['quantity']
-        
-        else:  # Random Regression
-            X, y = make_regression(n_samples=1000, n_features=4, noise=0.1, random_state=42)
-            self.df = pd.DataFrame(X, columns=[f'feature_{i+1}' for i in range(4)])
-            self.df['target'] = y
-        
-        st.session_state.data_loaded = True
-        st.sidebar.success(f"✅ {dataset_type} sample data generated! Shape: {self.df.shape}")
-    
-    def data_explorer_tab(self):
-        """Data explorer tab content"""
-        st.header("🔍 Data Explorer")
-        
-        if not st.session_state.data_loaded:
-            st.info("👆 Please upload a CSV file or generate sample data from the sidebar to get started!")
-            return
-        
-        # Data preview
-        st.subheader("Data Preview")
-        
-        col1, col2, col3 = st.columns([1, 1, 1])
-        with col1:
-            show_rows = st.slider("Number of rows to show", 5, 100, 10)
-        with col2:
-            start_row = st.number_input("Start from row", 0, len(self.df)-1, 0)
-        with col3:
-            st.metric("Total Rows", len(self.df))
-        
-        st.dataframe(self.df.iloc[start_row:start_row + show_rows], use_container_width=True)
-        
-        # Data information
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("Data Types")
-            dtype_df = pd.DataFrame(self.df.dtypes, columns=['Data Type'])
-            st.dataframe(dtype_df, use_container_width=True)
-        
-        with col2:
-            st.subheader("Missing Values")
-            missing_df = pd.DataFrame(self.df.isnull().sum(), columns=['Missing Values'])
-            missing_df['Percentage'] = (missing_df['Missing Values'] / len(self.df)) * 100
-            st.dataframe(missing_df, use_container_width=True)
-        
-        # Column operations
-        st.subheader("Column Operations")
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            if st.button("Show Column Names"):
-                st.write(list(self.df.columns))
-        
-        with col2:
-            if st.button("Describe Data"):
-                st.dataframe(self.df.describe(), use_container_width=True)
-        
-        with col3:
-            if st.download_button(
-                label="Download Data as CSV",
-                data=self.df.to_csv(index=False),
-                file_name="analyzed_data.csv",
-                mime="text/csv"
-            ):
-                st.success("Data downloaded successfully!")
-    
-    def visualization_tab(self):
-        """Visualization tab content"""
-        st.header("📈 Data Visualization")
-        
-        if not st.session_state.data_loaded:
-            st.info("👆 Please load data first in the Data Explorer tab!")
-            return
-        
-        # Visualization type selection
-        viz_type = st.selectbox(
-            "Choose visualization type:",
-            ["Scatter Plot", "Line Chart", "Bar Chart", "Histogram", "Box Plot", "Heatmap"]
-        )
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # X-axis selection
-            x_axis = st.selectbox("X-axis", self.df.select_dtypes(include=[np.number]).columns.tolist())
-        
-        with col2:
-            # Y-axis selection (for relevant plots)
-            if viz_type in ["Scatter Plot", "Line Chart"]:
-                y_axis = st.selectbox("Y-axis", self.df.select_dtypes(include=[np.number]).columns.tolist())
-        
-        # Additional options based on visualization type
-        if viz_type == "Scatter Plot":
-            color_by = st.selectbox("Color by", [None] + self.df.columns.tolist())
-            fig = px.scatter(self.df, x=x_axis, y=y_axis, color=color_by, 
-                           title=f"Scatter Plot: {x_axis} vs {y_axis}")
-        
-        elif viz_type == "Line Chart":
-            fig = px.line(self.df, x=x_axis, y=y_axis, title=f"Line Chart: {x_axis} vs {y_axis}")
-        
-        elif viz_type == "Bar Chart":
-            y_axis = st.selectbox("Y-axis", self.df.select_dtypes(include=[np.number]).columns.tolist())
-            fig = px.bar(self.df, x=x_axis, y=y_axis, title=f"Bar Chart: {x_axis} vs {y_axis}")
-        
-        elif viz_type == "Histogram":
-            fig = px.histogram(self.df, x=x_axis, title=f"Histogram of {x_axis}")
-        
-        elif viz_type == "Box Plot":
-            y_axis = st.selectbox("Y-axis", self.df.select_dtypes(include=[np.number]).columns.tolist())
-            fig = px.box(self.df, x=x_axis, y=y_axis, title=f"Box Plot: {x_axis} vs {y_axis}")
-        
-        else:  # Heatmap
-            numeric_cols = self.df.select_dtypes(include=[np.number]).columns
-            corr_matrix = self.df[numeric_cols].corr()
-            fig = px.imshow(corr_matrix, title="Correlation Heatmap", aspect="auto")
-        
-        # Display the plot
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Additional visualization controls
-        st.subheader("Visualization Controls")
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            if st.button("Update Chart"):
-                st.rerun()
-        
-        with col2:
-            if st.button("Save Chart as HTML"):
-                fig.write_html("chart.html")
-                st.success("Chart saved as chart.html")
-    
-    def ml_modeling_tab(self):
-        """Machine Learning modeling tab"""
-        st.header("🤖 Machine Learning Modeling")
-        
-        if not st.session_state.data_loaded:
-            st.info("👆 Please load data first in the Data Explorer tab!")
-            return
-        
-        # Model type selection
-        model_type = st.radio(
-            "Select model type:",
-            ["Classification", "Regression"]
-        )
-        
-        # Feature and target selection
-        numeric_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
-        
-        if len(numeric_cols) < 2:
-            st.error("Need at least 2 numeric columns for modeling!")
-            return
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            target_col = st.selectbox("Target variable", numeric_cols)
-        
-        with col2:
-            feature_cols = st.multiselect(
-                "Feature variables",
-                [col for col in numeric_cols if col != target_col],
-                default=[col for col in numeric_cols if col != target_col][:3]
-            )
-        
-        if not feature_cols:
-            st.warning("Please select at least one feature variable!")
-            return
-        
-        # Model parameters
-        st.subheader("Model Parameters")
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            test_size = st.slider("Test set size (%)", 10, 40, 20) / 100
-            n_estimators = st.slider("Number of estimators", 10, 200, 100)
-        
-        with col2:
-            random_state = st.number_input("Random state", 0, 100, 42)
-            max_depth = st.slider("Max depth", 1, 20, 10)
-        
-        if st.button("Train Model"):
-            with st.spinner("Training model..."):
-                try:
-                    # Prepare data
-                    X = self.df[feature_cols]
-                    y = self.df[target_col]
-                    
-                    # Split data
-                    X_train, X_test, y_train, y_test = train_test_split(
-                        X, y, test_size=test_size, random_state=random_state
-                    )
-                    
-                    # Train model
-                    if model_type == "Classification":
-                        model = RandomForestClassifier(
-                            n_estimators=n_estimators,
-                            max_depth=max_depth,
-                            random_state=random_state
-                        )
-                        model.fit(X_train, y_train)
-                        y_pred = model.predict(X_test)
-                        accuracy = accuracy_score(y_test, y_pred)
-                        
-                        # Display results
-                        st.success(f"✅ Model trained successfully!")
-                        col1, col2, col3 = st.columns(3)
-                        col1.metric("Accuracy", f"{accuracy:.3f}")
-                        col2.metric("Training samples", len(X_train))
-                        col3.metric("Test samples", len(X_test))
-                        
-                        # Feature importance
-                        st.subheader("Feature Importance")
-                        importance_df = pd.DataFrame({
-                            'feature': feature_cols,
-                            'importance': model.feature_importances_
-                        }).sort_values('importance', ascending=True)
-                        
-                        fig = px.bar(importance_df, x='importance', y='feature', 
-                                   orientation='h', title="Feature Importance")
-                        st.plotly_chart(fig, use_container_width=True)
-                    
-                    else:  # Regression
-                        model = RandomForestRegressor(
-                            n_estimators=n_estimators,
-                            max_depth=max_depth,
-                            random_state=random_state
-                        )
-                        model.fit(X_train, y_train)
-                        y_pred = model.predict(X_test)
-                        mse = mean_squared_error(y_test, y_pred)
-                        rmse = np.sqrt(mse)
-                        
-                        # Display results
-                        st.success(f"✅ Model trained successfully!")
-                        col1, col2, col3 = st.columns(3)
-                        col1.metric("RMSE", f"{rmse:.3f}")
-                        col2.metric("Training samples", len(X_train))
-                        col3.metric("Test samples", len(X_test))
-                        
-                        # Prediction vs Actual plot
-                        fig = px.scatter(x=y_test, y=y_pred, 
-                                       labels={'x': 'Actual', 'y': 'Predicted'},
-                                       title="Actual vs Predicted Values")
-                        fig.add_shape(type='line', line=dict(dash='dash'),
-                                    x0=y_test.min(), y0=y_test.min(),
-                                    x1=y_test.max(), y1=y_test.max())
-                        st.plotly_chart(fig, use_container_width=True)
-                
-                except Exception as e:
-                    st.error(f"Error training model: {str(e)}")
-    
-    def statistics_tab(self):
-        """Statistical analysis tab"""
-        st.header("📋 Statistical Analysis")
-        
-        if not st.session_state.data_loaded:
-            st.info("👆 Please load data first in the Data Explorer tab!")
-            return
-        
-        # Basic statistics
-        st.subheader("Descriptive Statistics")
-        st.dataframe(self.df.describe(), use_container_width=True)
-        
-        # Correlation matrix
-        st.subheader("Correlation Matrix")
-        numeric_cols = self.df.select_dtypes(include=[np.number]).columns
-        if len(numeric_cols) > 1:
-            corr_matrix = self.df[numeric_cols].corr()
-            fig = px.imshow(corr_matrix, title="Correlation Matrix", 
-                          color_continuous_scale='RdBu_r', aspect="auto")
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # Outlier detection
-        st.subheader("Outlier Analysis")
-        numeric_col = st.selectbox("Select column for outlier analysis", numeric_cols)
-        
-        if numeric_col:
-            Q1 = self.df[numeric_col].quantile(0.25)
-            Q3 = self.df[numeric_col].quantile(0.75)
-            IQR = Q3 - Q1
-            lower_bound = Q1 - 1.5 * IQR
-            upper_bound = Q3 + 1.5 * IQR
-            
-            outliers = self.df[(self.df[numeric_col] < lower_bound) | (self.df[numeric_col] > upper_bound)]
-            
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Lower Bound", f"{lower_bound:.2f}")
-            col2.metric("Upper Bound", f"{upper_bound:.2f}")
-            col3.metric("Number of Outliers", len(outliers))
-            col4.metric("Outlier Percentage", f"{(len(outliers)/len(self.df))*100:.2f}%")
-            
-            if len(outliers) > 0:
-                st.write("Outlier samples:")
-                st.dataframe(outliers.head(10), use_container_width=True)
-    
-    def stock_analysis_tab(self):
-        """Stock market analysis tab"""
-        st.header("📊 Stock Market Analysis")
-        
-        if not st.session_state.stock_data_loaded:
-            st.info("👆 Please fetch stock data from the sidebar to get started!")
-            
-            # Display available sectors
-            st.subheader("Available Sectors & Stocks")
-            for sector, stocks in SECTORS.items():
-                with st.expander(f"📁 {sector}"):
-                    for stock in stocks:
-                        st.write(f"• {stock}")
-            return
-        
-        # Stock data overview
-        st.subheader("Stock Data Overview")
-        
-        # Calculate basic metrics
-        stocks = self.stock_data.columns.levels[0]
-        
-        # Display key metrics for each stock
-        st.write("### Key Metrics")
-        cols = st.columns(min(5, len(stocks)))
-        
-        metrics_data = []
-        for i, stock in enumerate(stocks):
-            col_idx = i % len(cols)
-            with cols[col_idx]:
-                try:
-                    close_prices = self.stock_data[stock]['Close']
-                    latest_price = close_prices.iloc[-1]
-                    prev_price = close_prices.iloc[-2] if len(close_prices) > 1 else latest_price
-                    change = ((latest_price - prev_price) / prev_price) * 100
-                    
-                    st.metric(
-                        label=stock,
-                        value=f"₹{latest_price:.2f}",
-                        delta=f"{change:.2f}%"
-                    )
-                    
-                    metrics_data.append({
-                        'Stock': stock,
-                        'Latest Price': latest_price,
-                        'Daily Change %': change,
-                        'Volume': self.stock_data[stock]['Volume'].iloc[-1]
-                    })
-                except Exception as e:
-                    st.error(f"Error processing {stock}: {str(e)}")
-        
-        # Price charts
-        st.subheader("Price Charts")
-        
-        chart_type = st.radio("Chart Type", ["Line Chart", "Candlestick"], horizontal=True)
-        selected_stocks = st.multiselect("Select stocks to display", stocks.tolist(), default=stocks[:3].tolist())
-        
-        if selected_stocks:
-            if chart_type == "Line Chart":
-                fig = go.Figure()
-                for stock in selected_stocks:
-                    fig.add_trace(go.Scatter(
-                        x=self.stock_data.index,
-                        y=self.stock_data[stock]['Close'],
-                        name=stock,
-                        mode='lines'
-                    ))
-                fig.update_layout(
-                    title="Stock Price Trends",
-                    xaxis_title="Date",
-                    yaxis_title="Price (₹)",
-                    hovermode='x unified'
-                )
-            else:
-                # Candlestick chart for first selected stock
-                stock = selected_stocks[0]
-                fig = go.Figure(data=[go.Candlestick(
-                    x=self.stock_data.index,
-                    open=self.stock_data[stock]['Open'],
-                    high=self.stock_data[stock]['High'],
-                    low=self.stock_data[stock]['Low'],
-                    close=self.stock_data[stock]['Close'],
-                    name=stock
-                )])
-                fig.update_layout(
-                    title=f"Candlestick Chart - {stock}",
-                    xaxis_title="Date",
-                    yaxis_title="Price (₹)"
-                )
-            
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # Sector performance analysis
-        st.subheader("Sector Performance")
-        
-        # Calculate sector-wise returns
-        sector_returns = {}
-        for sector, sector_stocks in SECTORS.items():
-            available_stocks = [s for s in sector_stocks if s in stocks]
-            if available_stocks:
-                returns = []
-                for stock in available_stocks:
-                    try:
-                        close_prices = self.stock_data[stock]['Close']
-                        if len(close_prices) > 1:
-                            total_return = ((close_prices.iloc[-1] - close_prices.iloc[0]) / close_prices.iloc[0]) * 100
-                            returns.append(total_return)
-                    except:
-                        continue
-                if returns:
-                    sector_returns[sector] = np.mean(returns)
-        
-        if sector_returns:
-            fig = px.bar(
-                x=list(sector_returns.keys()),
-                y=list(sector_returns.values()),
-                title="Sector-wise Average Returns (%)",
-                labels={'x': 'Sector', 'y': 'Return (%)'}
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # Correlation heatmap
-        st.subheader("Stock Correlation Matrix")
-        
-        # Create correlation matrix of closing prices
-        close_data = pd.DataFrame()
-        for stock in stocks:
-            close_data[stock] = self.stock_data[stock]['Close']
-        
-        corr_matrix = close_data.corr()
-        fig = px.imshow(
-            corr_matrix,
-            title="Stock Correlation Heatmap",
-            color_continuous_scale='RdBu_r',
-            aspect="auto"
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    
-    def settings_tab(self):
-        """Settings tab"""
-        st.header("⚙️ Application Settings")
-        
-        st.subheader("Data Management")
-        
-        if st.session_state.data_loaded or st.session_state.stock_data_loaded:
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                if st.button("Clear Current Data"):
-                    st.session_state.data_loaded = False
-                    st.session_state.stock_data_loaded = False
-                    self.df = None
-                    self.stock_data = None
-                    st.rerun()
-            
-            with col2:
-                if st.button("Reset All Settings"):
-                    for key in list(st.session_state.keys()):
-                        del st.session_state[key]
-                    st.rerun()
-        
-        st.subheader("Available Sectors")
-        for sector, stocks in SECTORS.items():
-            st.markdown(f"""
-            <div class="sector-card">
-                <h4>{sector}</h4>
-                <p>{', '.join(stocks)}</p>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        st.subheader("About")
-        st.markdown("""
-        This Data Analysis Dashboard is built with Streamlit and provides:
-        - 📊 Data exploration and visualization
-        - 🤖 Machine learning modeling
-        - 📋 Statistical analysis
-        - 📈 Stock market analysis
-        - ⚙️ Customizable settings
-        
-        **Libraries used:** Streamlit, Pandas, Plotly, Scikit-learn, NumPy, yFinance
-        """)
+            hist, info, tkobj = fetch_data(t)
+        except:
+            hist, info, tkobj = pd.DataFrame(), {}, None
 
-# Run the application
-if __name__ == "__main__":
-    app = DataAnalysisApp()
-    app.main()
+        # Financial metrics
+        if hist.empty:
+            ann, vol, sr, mom = [np.nan]*4
+        else:
+            close = hist["Close"]
+            ann = annualized_return_from_series(close)
+            vol = annualized_volatility(close.pct_change())
+            sr = sharpe_ratio(ann, vol)
+            mom = momentum_12m(close)
+
+        # Fundamentals
+        pe = safe_get(info, "trailingPE")
+        dy = safe_get(info, "dividendYield")
+        name = safe_get(info, "shortName", t)
+        sector = safe_get(info, "sector", "Unknown")
+        cap = safe_get(info, "marketCap")
+        beta = safe_get(info, "beta")
+
+        # Sentiment
+        sentiment = get_comprehensive_sentiment(tkobj, t) if tkobj else \
+            {"combined_score":0, "textblob_score":0, "vader_score":0,
+             "article_count":0, "positive_count":0, "negative_count":0, "neutral_count":0}
+
+        # Technical Indicators
+        tech = compute_technical_indicators(hist)
+
+        rows.append({
+            "ticker": t,
+            "name": name,
+            "sector": sector,
+            "marketCap": cap,
+            "annual_return": ann,
+            "volatility": vol,
+            "sharpe": sr,
+            "momentum": mom,
+            "pe": pe,
+            "dividend_yield": dy,
+            "beta": beta,
+            # Sentiment
+            "sentiment": sentiment["combined_score"],
+            "textblob_sentiment": sentiment["textblob_score"],
+            "vader_sentiment": sentiment["vader_score"],
+            "news_articles": sentiment["article_count"],
+            "positive_news": sentiment["positive_count"],
+            "negative_news": sentiment["negative_count"],
+            "neutral_news": sentiment["neutral_count"],
+            # Technical
+            "technical": tech["technical_score"],
+            "rsi": tech["rsi"],
+            "macd_signal": tech["macd_signal"],
+            "bb_position": tech["bb_position"],
+            "ma_trend": tech["ma_trend"],
+            "adx": tech["adx"],
+            "stoch": tech["stoch"],
+            "tech_signal": tech["signal_strength"]
+        })
+
+    return pd.DataFrame(rows).set_index("ticker")
+
+# ============================================================
+#   NORMALIZATION & SCORING
+# ============================================================
+
+def normalize_series_for_score(s, higher_is_better=True):
+    s = s.astype(float)
+    valid = s.dropna()
+    if valid.empty:
+        return pd.Series(0.0, index=s.index)
+
+    lo, hi = valid.min(), valid.max()
+    norm = (s - lo) / (hi - lo) if hi != lo else pd.Series(0.5, index=s.index)
+    norm = norm.fillna(0.0)
+
+    return norm if higher_is_better else 1 - norm
+
+def score_universe(df):
+    norm = pd.DataFrame(index=df.index)
+    norm["annual_return"] = normalize_series_for_score(df["annual_return"])
+    norm["sharpe"] = normalize_series_for_score(df["sharpe"])
+    norm["volatility"] = normalize_series_for_score(df["volatility"], higher_is_better=False)
+    norm["pe"] = normalize_series_for_score(df["pe"], higher_is_better=False)
+    norm["dividend_yield"] = normalize_series_for_score(df["dividend_yield"])
+    norm["momentum"] = normalize_series_for_score(df["momentum"])
+    norm["sentiment"] = normalize_series_for_score(df["sentiment"])
+    norm["technical"] = normalize_series_for_score(df["technical"])
+
+    comp = pd.Series(0.0, index=df.index)
+    for metric, w in WEIGHTS.items():
+        comp += norm[metric] * w
+
+    df2 = df.copy()
+    for col in norm.columns:
+        df2[f"norm_{col}"] = norm[col]
+
+    df2["composite_score"] = comp
+    return df2.sort_values("composite_score", ascending=False)
+
+# ============================================================
+#   FINAL RECOMMENDATION
+# ============================================================
+
+def generate_final_recommendation(result_df):
+
+    if result_df.empty:
+        print("No data to recommend.")
+        return
+
+    top = result_df.iloc[0]
+    ticker = top.name
+    score = top["composite_score"]
+
+    # SIMPLE PRINT OUTPUT
+    print("\n\n========== FINAL RECOMMENDATION ==========")
+    print(f"🏆 Best Stock: {ticker} ({top['name']})")
+    print(f"🎯 Composite Score: {score:.3f}")
+    print(f"📈 Sector: {top['sector']}")
+    print(f"👍 Technical Signal: {top['tech_signal']}")
+    print(f"📰 Sentiment Score: {top['sentiment']:.3f}")
+    print(f"⚡ Sharpe Ratio: {top['sharpe']:.2f}")
+    print(f"📊 Annual Return: {top['annual_return']:.2%}")
+    print(f"🚀 Momentum (12m): {top['momentum']:.2%}")
+    print("==========================================\n")
+
+
+# ============================================================
+#               EXECUTION
+# ============================================================
+
+df = build_metrics(TICKERS)
+result = score_universe(df)
+generate_final_recommendation(result)
